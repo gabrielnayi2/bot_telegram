@@ -1687,9 +1687,18 @@ def register_handlers(application: Application) -> None:
 
 
 def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    primary_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    fallback_token = os.getenv("ELEGRAM_BOT_TOKEN")
+    token = primary_token or fallback_token
     if not token:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno.")
+        raise RuntimeError(
+            "Falta TELEGRAM_BOT_TOKEN en variables de entorno "
+            "(tambien se acepta ELEGRAM_BOT_TOKEN como fallback)."
+        )
+    if fallback_token and not primary_token:
+        logger.warning(
+            "Usando ELEGRAM_BOT_TOKEN como fallback. Recomendado: renombrar a TELEGRAM_BOT_TOKEN."
+        )
 
     init_db()
 

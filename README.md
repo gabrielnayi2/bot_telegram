@@ -64,6 +64,8 @@ Configura variables de entorno:
 
 ```bash
 export TELEGRAM_BOT_TOKEN="TU_TOKEN_AQUI"
+# Compatibilidad temporal (si creaste el secret con typo):
+# export ELEGRAM_BOT_TOKEN="TU_TOKEN_AQUI"
 # Opcional (si no se define, usa sqlite:///ops.db):
 # export DATABASE_URL="postgresql+psycopg://usuario:password@host:5432/bot_telegram"
 ```
@@ -205,6 +207,7 @@ Con `/void OP-...`:
 ## Variables de entorno
 
 - `TELEGRAM_BOT_TOKEN` (obligatoria)
+- `ELEGRAM_BOT_TOKEN` (fallback compatible por typo; recomendado corregir a TELEGRAM_BOT_TOKEN)
 - `DATABASE_URL` (opcional)
 
 Ejemplos:
