@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -113,7 +114,7 @@ class Client(Base):
 class TelegramLink(Base):
     __tablename__ = "telegram_links"
 
-    telegram_user_id: Mapped[int] = mapped_column(Integer, primary_key=True, unique=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, unique=True)
     client_code: Mapped[str] = mapped_column(
         String(32), ForeignKey("clients.code"), nullable=False, index=True
     )
@@ -135,7 +136,7 @@ class Operation(Base):
     tc: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=STATUS_OPEN)
     nota: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_by_telegram_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by_telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_by_username: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     raw_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
@@ -517,7 +518,10 @@ async def reply(update: Update, text: str, reply_markup: Optional[InlineKeyboard
 
 async def ack_query(update: Update) -> None:
     if update.callback_query:
-        await update.callback_query.answer()
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            logger.debug("No se pudo responder callback query.", exc_info=True)
 
 
 def menu_keyboard() -> InlineKeyboardMarkup:
@@ -759,13 +763,15 @@ async def setcomision_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     client_code = normalize_client_code(context.args[0])
     try:
-        amount = parse_positive_number(context.args[1], field_name="comision")
+        amount = float(context.args[1].strip().replace(",", "."))
     except ValueError:
-        if context.args[1] in {"0", "0.0", "0,0"}:
-            amount = 0.0
-        else:
-            await reply(update, "Monto de comision invalido.")
-            return
+        await reply(update, "Monto de comision invalido.")
+        return
+
+    if amount < 0:
+        await reply(update, "La comision no puede ser negativa.")
+        return
+    amount = round(amount, 2)
 
     with session_scope() as db:
         client = db.get(Client, client_code)
