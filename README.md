@@ -101,6 +101,10 @@ Cliente Tres;0
 /clientes
 ```
 
+Validacion de nombres:
+
+- No se permite crear dos clientes con el mismo nombre (comparacion case-insensitive, sin acentos y sin duplicar espacios).
+
 Tambien existe comando legacy manual:
 
 ```text
@@ -186,6 +190,7 @@ Reglas aplicadas por el bot:
 - Si `CLIENTE_ENVIA` tiene comision activa (`/setcomision`), se aplica automaticamente:
   - comision ARS = `IMPORTE * (%/100)`
   - el saldo a pagar de `CLIENTE_ENVIA` se reduce por esa comision.
+- No permite cargar dos operaciones iguales en la misma fecha (misma dupla cliente/contraparte, monto, pacto, tc/usd pactados).
 
 ## Flujos wizard (legacy / opcionales)
 

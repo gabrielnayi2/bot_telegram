@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shlex
+import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from typing import Any, Optional
@@ -347,6 +348,13 @@ def normalize_client_code(raw: str) -> str:
     return raw.strip().upper()
 
 
+def normalize_client_name(raw: str) -> str:
+    compact = " ".join(raw.strip().split())
+    normalized = unicodedata.normalize("NFKD", compact)
+    without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return without_accents.casefold()
+
+
 def validate_client_code_format(code: str) -> bool:
     return bool(CLIENT_CODE_RE.match(code))
 
@@ -469,6 +477,18 @@ def compute_next_client_code(db: Session) -> str:
     return f"C{next_seq:0{width}d}"
 
 
+def find_client_by_normalized_name(
+    db: Session, name: str, exclude_code: Optional[str] = None
+) -> Optional[Client]:
+    target = normalize_client_name(name)
+    for client in db.execute(select(Client).order_by(Client.code)).scalars().all():
+        if exclude_code and client.code == exclude_code:
+            continue
+        if normalize_client_name(client.name) == target:
+            return client
+    return None
+
+
 def create_client_with_auto_code(
     db: Session,
     name: str,
@@ -476,6 +496,11 @@ def create_client_with_auto_code(
 ) -> Client:
     if not name.strip():
         raise ValueError("El nombre del cliente no puede estar vacio.")
+    duplicate = find_client_by_normalized_name(db, name)
+    if duplicate:
+        raise ValueError(
+            f"Ya existe un cliente con ese nombre: {duplicate.code} ({duplicate.name})."
+        )
 
     commission_enabled = commission_pct > 0
     # Reintenta en caso de colision de codigo por concurrencia.
@@ -501,17 +526,62 @@ def resolve_client_by_identifier(db: Session, identifier: str) -> tuple[Optional
     if by_code:
         return by_code, None
 
-    by_name = db.execute(
-        select(Client).where(func.lower(Client.name) == identifier.strip().lower())
-    ).scalars().all()
+    target_name = normalize_client_name(identifier)
+    by_name = [
+        client
+        for client in db.execute(select(Client).order_by(Client.code)).scalars().all()
+        if normalize_client_name(client.name) == target_name
+    ]
     if len(by_name) == 1:
         return by_name[0], None
     if len(by_name) > 1:
+        codes = ", ".join(client.code for client in by_name)
         return None, (
             f"El identificador '{identifier}' coincide con varios clientes por nombre. "
-            "Usa el codigo (ej: C001)."
+            f"Usa codigo ({codes})."
         )
     return None, f"No existe cliente con codigo o nombre '{identifier}'."
+
+
+def _round_optional(value: Optional[float], digits: int) -> Optional[float]:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def find_duplicate_operation(
+    db: Session,
+    *,
+    op_date: date,
+    cliente: str,
+    contraparte: str,
+    monto_ars: float,
+    pacto: str,
+    usd_pactados: Optional[float],
+    tc: Optional[float],
+) -> Optional[str]:
+    candidates = db.execute(
+        select(Operation).where(
+            Operation.op_date == op_date,
+            Operation.cliente == cliente,
+            Operation.contraparte == contraparte,
+            Operation.pacto == pacto,
+            Operation.status == STATUS_OPEN,
+        )
+    ).scalars().all()
+    monto_target = round(float(monto_ars), 2)
+    usd_target = _round_optional(usd_pactados, 2)
+    tc_target = _round_optional(tc, 6)
+
+    for operation in candidates:
+        if round(float(operation.monto_ars), 2) != monto_target:
+            continue
+        if _round_optional(operation.usd_pactados, 2) != usd_target:
+            continue
+        if _round_optional(operation.tc, 6) != tc_target:
+            continue
+        return operation.display_id
+    return None
 
 
 def next_sequence(existing_ids: list[str]) -> int:
@@ -868,6 +938,26 @@ async def structured_operation_message_handler(
             )
             usd_pactados = None if tc_is_one else contraparte_amount
 
+            duplicate_id = find_duplicate_operation(
+                db,
+                op_date=op_date,
+                cliente=cliente_envia.code,
+                contraparte=cliente_recibe.code,
+                monto_ars=payload.importe,
+                pacto=pacto,
+                usd_pactados=usd_pactados,
+                tc=payload.tc,
+            )
+            if duplicate_id:
+                await reply(
+                    update,
+                    (
+                        "Operacion duplicada detectada para la misma fecha. "
+                        f"Ya existe: {duplicate_id}"
+                    ),
+                )
+                return
+
             db.add(
                 Operation(
                     display_id=display_id,
@@ -1056,6 +1146,18 @@ async def nuevocliente_name_received(update: Update, context: ContextTypes.DEFAU
         await reply(update, "Nombre demasiado largo (maximo 120 caracteres). Intenta de nuevo:")
         return NEW_CLIENT_NAME
 
+    with session_scope() as db:
+        duplicate = find_client_by_normalized_name(db, name)
+    if duplicate:
+        await reply(
+            update,
+            (
+                f"Ya existe un cliente con ese nombre: {duplicate.code} ({duplicate.name}).\n"
+                "Ingresa otro nombre:"
+            ),
+        )
+        return NEW_CLIENT_NAME
+
     context.user_data[NEW_CLIENT_DATA_KEY] = {"name": name}
     await reply(
         update,
@@ -1115,6 +1217,12 @@ async def nuevocliente_confirm_received(update: Update, context: ContextTypes.DE
     try:
         with session_scope() as db:
             client = create_client_with_auto_code(db, name=name, commission_pct=commission_pct)
+    except ValueError as exc:
+        await reply(update, str(exc))
+    except Exception as exc:
+        logger.exception("Error creando cliente nuevo", exc_info=exc)
+        await reply(update, "No pude crear el cliente por un error interno.")
+    else:
         await reply(
             update,
             (
@@ -1123,9 +1231,6 @@ async def nuevocliente_confirm_received(update: Update, context: ContextTypes.DE
                 f"Comision: {commission_pct:.4g}%"
             ),
         )
-    except Exception as exc:
-        logger.exception("Error creando cliente nuevo", exc_info=exc)
-        await reply(update, "No pude crear el cliente por un error interno.")
     finally:
         context.user_data.pop(NEW_CLIENT_DATA_KEY, None)
     return ConversationHandler.END
@@ -1165,8 +1270,35 @@ async def importclientes_command(update: Update, context: ContextTypes.DEFAULT_T
         await reply(update, f"Error en listado: {exc}")
         return
 
+    seen_in_payload: dict[str, str] = {}
+    for idx, (name, _pct) in enumerate(parsed, start=1):
+        normalized_name = normalize_client_name(name)
+        if normalized_name in seen_in_payload:
+            first_name = seen_in_payload[normalized_name]
+            await reply(
+                update,
+                (
+                    f"Error en listado (linea {idx}): nombre duplicado '{name}'.\n"
+                    f"Ya aparece como '{first_name}'."
+                ),
+            )
+            return
+        seen_in_payload[normalized_name] = name
+
     try:
         with session_scope() as db:
+            for idx, (name, _commission_pct) in enumerate(parsed, start=1):
+                duplicate = find_client_by_normalized_name(db, name)
+                if duplicate:
+                    await reply(
+                        update,
+                        (
+                            f"Error en listado (linea {idx}): '{name}' ya existe "
+                            f"como {duplicate.code} ({duplicate.name})."
+                        ),
+                    )
+                    return
+
             created: list[Client] = []
             for name, commission_pct in parsed:
                 created.append(
@@ -1209,6 +1341,18 @@ async def addcliente_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     with session_scope() as db:
         client = db.get(Client, client_code)
+        duplicate = find_client_by_normalized_name(
+            db, name, exclude_code=client_code if client else None
+        )
+        if duplicate:
+            await reply(
+                update,
+                (
+                    f"No se puede guardar: el nombre ya existe en "
+                    f"{duplicate.code} ({duplicate.name})."
+                ),
+            )
+            return
         if client:
             client.name = name
             action = "actualizado"
@@ -1634,6 +1778,26 @@ async def op_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             contraparte = db.get(Client, payload.contraparte)
             if not cliente or not contraparte:
                 await reply(update, "Cliente o contraparte no existen. Reintenta.")
+                return ConversationHandler.END
+
+            duplicate_id = find_duplicate_operation(
+                db,
+                op_date=date.today(),
+                cliente=payload.cliente,
+                contraparte=payload.contraparte,
+                monto_ars=payload.monto_ars,
+                pacto=payload.pacto,
+                usd_pactados=payload.usd_pactados,
+                tc=payload.tc,
+            )
+            if duplicate_id:
+                await reply(
+                    update,
+                    (
+                        "Operacion duplicada detectada para la fecha de hoy. "
+                        f"Ya existe: {duplicate_id}"
+                    ),
+                )
                 return ConversationHandler.END
 
             display_id = compute_display_id(db, date.today(), payload.cliente)
