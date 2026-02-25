@@ -25,6 +25,7 @@ Modo principal: alta de operaciones por mensaje estructurado de 4 lineas (sin bo
 2. **Alta de clientes con ID automatico**:
    - Alta guiada (`/nuevocliente`) y alta masiva (`/importclientes`).
    - IDs correlativos: `C001`, `C002`, ...
+   - Eliminacion segura (`/delcliente C001`) solo si no tiene historial.
 3. **Registrar cobro** (mueve caja):
    - Reduce saldo a cobrar del cliente.
    - Incrementa caja efectiva.
@@ -129,6 +130,7 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 - `/comisiones C001 2026-01-01 2026-01-31`
 - `/nuevocliente` (alta guiada con ID automatico)
 - `/importclientes` (alta masiva por listado)
+- `/delcliente C001` (elimina cliente sin movimientos)
 - `/addcliente C001 "Nombre"` (legacy/manual)
 - `/clientes`
 - `/void OP-YYYYMMDD-C001-0001`

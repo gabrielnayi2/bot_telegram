@@ -15,9 +15,11 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    delete,
     Float,
     ForeignKey,
     Integer,
+    or_,
     String,
     Text,
     create_engine,
@@ -773,6 +775,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/comisiones [C001] [YYYY-MM-DD YYYY-MM-DD]\n"
         "/nuevocliente - alta guiada con ID automatico\n"
         "/importclientes - alta masiva por listado\n"
+        "/delcliente C001 - elimina cliente sin movimientos\n"
         "/addcliente C001 \"Cliente Ejemplo\"\n"
         "/clientes\n"
         "/void OP-YYYYMMDD-C001-0001"
@@ -785,7 +788,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Menu rapido:\n"
         "1) Para registrar operacion: envia 4 lineas (usa /formato)\n"
         "2) Consultas: /saldo [C001] y /cajas\n"
-        "3) Clientes: /nuevocliente, /importclientes, /clientes, /setcliente\n"
+        "3) Clientes: /nuevocliente, /importclientes, /delcliente, /clientes, /setcliente\n"
         "4) Comisiones: /setcomision y /comisiones\n"
         "5) Anular: /void OP-YYYYMMDD-C001-0001\n"
         "6) Flujos legacy por wizard (opcionales): /op, /cobro, /pago, /liquidar"
@@ -1388,6 +1391,70 @@ async def void_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         operation.status = STATUS_VOID
 
     await reply(update, f"Operacion {display_id} anulada. Se generaron asientos VOID.")
+
+
+async def delcliente_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await reply(update, "Uso: /delcliente C001")
+        return
+
+    identifier = " ".join(context.args).strip()
+    if not identifier:
+        await reply(update, "Uso: /delcliente C001")
+        return
+
+    with session_scope() as db:
+        client, error = resolve_client_by_identifier(db, identifier)
+        if error or not client:
+            await reply(update, error or "Cliente no encontrado.")
+            return
+        if client.code == HOUSE_CODE:
+            await reply(update, "No se puede eliminar el cliente interno HOUSE.")
+            return
+
+        operations_count = db.scalar(
+            select(func.count(Operation.id)).where(
+                or_(Operation.cliente == client.code, Operation.contraparte == client.code)
+            )
+        ) or 0
+        ledger_count = db.scalar(
+            select(func.count(Ledger.id)).where(Ledger.client_code == client.code)
+        ) or 0
+        cash_count = db.scalar(
+            select(func.count(CashMovement.id)).where(CashMovement.client_code == client.code)
+        ) or 0
+
+        if operations_count > 0 or ledger_count > 0 or cash_count > 0:
+            await reply(
+                update,
+                (
+                    f"No se puede eliminar {client.code}: tiene historial.\n"
+                    f"- Operaciones: {operations_count}\n"
+                    f"- Asientos ledger: {ledger_count}\n"
+                    f"- Movimientos de caja: {cash_count}"
+                ),
+            )
+            return
+
+        links_deleted = db.scalar(
+            select(func.count(TelegramLink.telegram_user_id)).where(
+                TelegramLink.client_code == client.code
+            )
+        ) or 0
+        if links_deleted > 0:
+            db.execute(delete(TelegramLink).where(TelegramLink.client_code == client.code))
+
+        deleted_code = client.code
+        deleted_name = client.name
+        db.delete(client)
+
+    await reply(
+        update,
+        (
+            f"Cliente eliminado: {deleted_code} - {deleted_name}\n"
+            f"Vinculos Telegram eliminados: {int(links_deleted)}"
+        ),
+    )
 
 
 async def op_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2192,6 +2259,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("setcomision", setcomision_command))
     application.add_handler(CommandHandler("comisiones", comisiones_command))
     application.add_handler(CommandHandler("importclientes", importclientes_command))
+    application.add_handler(CommandHandler("delcliente", delcliente_command))
     application.add_handler(CommandHandler("addcliente", addcliente_command))
     application.add_handler(CommandHandler("clientes", clientes_command))
     application.add_handler(CommandHandler("void", void_command))
