@@ -2318,6 +2318,12 @@ async def liq_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text if update.effective_message else "").strip()
+    command_token = text.split(maxsplit=1)[0].lower() if text else ""
+    base_command = command_token.split("@", 1)[0]
+    if base_command in {"/dbinfo", "/db"}:
+        await dbinfo_command(update, context)
+        return
     await reply(
         update,
         "Comando no reconocido. Usa /menu, /formato, /dbinfo o /nuevocliente para ver opciones.",
@@ -2377,7 +2383,6 @@ def build_operation_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(op_cancel, pattern=r"^op:cancel$"),
         ],
-        per_message=True,
         allow_reentry=True,
     )
 
@@ -2407,7 +2412,6 @@ def build_cash_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(cash_cancel, pattern=r"^cash:cancel$"),
         ],
-        per_message=True,
         allow_reentry=True,
     )
 
@@ -2432,7 +2436,6 @@ def build_liq_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(liq_cancel, pattern=r"^liq:cancel$"),
         ],
-        per_message=True,
         allow_reentry=True,
     )
 
@@ -2447,6 +2450,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("formato", formato_command))
     application.add_handler(CommandHandler("dbinfo", dbinfo_command))
+    application.add_handler(CommandHandler("db", dbinfo_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("setcliente", setcliente_command))
     application.add_handler(CommandHandler("saldo", saldo_command))
