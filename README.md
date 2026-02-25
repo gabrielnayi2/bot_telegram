@@ -1,6 +1,7 @@
 # bot_telegram
 
-Bot de Telegram en Python para registrar operaciones financieras con flujos paso a paso (wizard).
+Bot de Telegram en Python para registrar operaciones financieras.
+Modo principal: alta de operaciones por mensaje estructurado de 4 lineas (sin botones).
 
 ## Stack
 
@@ -13,10 +14,14 @@ Bot de Telegram en Python para registrar operaciones financieras con flujos paso
 
 ## Funcionalidades principales
 
-1. **Nueva operacion** (no mueve caja):
-   - Genera saldo por cliente/contraparte.
-   - Soporta pacto `PAGA_ARS` o `PAGA_USD`.
-   - Puede aplicar comision fija por cliente.
+1. **Nueva operacion por mensaje estructurado** (no mueve caja):
+   - El bot procesa automaticamente mensajes de 4 lineas:
+     - `CLIENTE_ENVIA`
+     - `CLIENTE_RECIBE`
+     - `TC`
+     - `IMPORTE`
+   - Genera fecha e ID de operacion de forma automatica.
+   - Aplica reglas por TC y comision por cliente.
 2. **Registrar cobro** (mueve caja):
    - Reduce saldo a cobrar del cliente.
    - Incrementa caja efectiva.
@@ -97,7 +102,8 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 ## Comandos
 
 - `/start` - ayuda inicial
-- `/menu` - menu con botones
+- `/menu` - ayuda rapida (sin botones)
+- `/formato` - muestra plantilla de carga estructurada
 - `/setcliente C001`
 - `/saldo [C001]`
 - `/cajas`
@@ -109,7 +115,7 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 - `/addcliente C001 "Nombre"`
 - `/clientes`
 - `/void OP-YYYYMMDD-C001-0001`
-- `/cancel` (durante cualquier wizard)
+- `/cancel` (durante flujos wizard legacy)
 
 ## IDs humanos
 
@@ -118,7 +124,48 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 
 La secuencia es por cliente y fecha.
 
-## Flujos wizard
+## Registro de operacion por mensaje (recomendado)
+
+Envia un mensaje de **4 lineas**:
+
+```text
+CLIENTE_ENVIA
+CLIENTE_RECIBE
+TC
+IMPORTE
+```
+
+Ejemplo:
+
+```text
+C001
+C002
+1250
+150000
+```
+
+Tambien puedes usar etiquetas:
+
+```text
+CLIENTE ENVIA: C001
+CLIENTE RECIBE: C002
+TC: 1250
+IMPORTE: 150000
+```
+
+Reglas aplicadas por el bot:
+
+- Fecha de operacion: fecha del mensaje recibido.
+- ID humano: `OP-YYYYMMDD-<CLIENTE_ENVIA>-0001` (correlativo por cliente y dia).
+- Si `TC = 1`:
+  - `CLIENTE_ENVIA` queda en ARS a pagar (`-IMPORTE`).
+  - `CLIENTE_RECIBE` queda en ARS a cobrar (`+IMPORTE`).
+- Si `TC > 1`:
+  - `CLIENTE_ENVIA` queda en ARS a pagar (`-IMPORTE`).
+  - `CLIENTE_RECIBE` queda en USD a cobrar (`+(IMPORTE/TC)` redondeado a 2 decimales).
+- Si el cliente tiene comision activa (`/setcomision`), se aplica automaticamente.
+
+## Flujos wizard (legacy / opcionales)
 
 ### 1) Nueva operacion
 

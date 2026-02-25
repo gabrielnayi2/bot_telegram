@@ -68,6 +68,18 @@ CASHBOXES_BY_CURRENCY = {
 }
 ALL_CASHBOXES = ["R1_ARS", "R1_USD", "R2_ARS", "R2_USD"]
 CLIENT_CODE_RE = re.compile(r"^[A-Z0-9_]{2,32}$")
+STRUCTURED_OPERATION_FORMAT = (
+    "Formato de carga (4 lineas):\n"
+    "CLIENTE_ENVIA\n"
+    "CLIENTE_RECIBE\n"
+    "TC\n"
+    "IMPORTE\n\n"
+    "Ejemplo:\n"
+    "C001\n"
+    "C002\n"
+    "1250\n"
+    "150000"
+)
 
 
 (
@@ -259,6 +271,26 @@ class LiquidationInput(BaseModel):
         return normalize_client_code(value)
 
 
+class StructuredOperationInput(BaseModel):
+    cliente_envia: str
+    cliente_recibe: str
+    tc: float = Field(ge=1)
+    importe: float = Field(gt=0)
+
+    @field_validator("cliente_envia", "cliente_recibe")
+    @classmethod
+    def normalize_client(cls, value: str) -> str:
+        return normalize_client_code(value)
+
+    @model_validator(mode="after")
+    def validate_distinct_clients(self) -> "StructuredOperationInput":
+        if self.cliente_envia == self.cliente_recibe:
+            raise ValueError("CLIENTE_ENVIA y CLIENTE_RECIBE no pueden ser iguales.")
+        if self.tc < 1:
+            raise ValueError("TC debe ser 1 o mayor.")
+        return self
+
+
 ENGINE = None
 SessionLocal: Optional[sessionmaker] = None
 
@@ -342,6 +374,59 @@ def normalize_note(raw: str) -> Optional[str]:
     if cleaned in {"", "-", "none", "sin", "ninguna"}:
         return None
     return cleaned
+
+
+def normalize_label(raw: str) -> str:
+    translated = raw.upper().translate(str.maketrans("ÁÉÍÓÚÜ", "AEIOUU"))
+    return re.sub(r"[^A-Z0-9]+", " ", translated).strip()
+
+
+def extract_structured_value(raw_line: str, accepted_labels: set[str]) -> str:
+    line = raw_line.strip()
+    if ":" not in line:
+        return line
+    label, value = line.split(":", 1)
+    if normalize_label(label) in accepted_labels:
+        return value.strip()
+    return line
+
+
+def parse_structured_operation_message(text: str) -> StructuredOperationInput:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 4:
+        raise ValueError(
+            "Debes enviar exactamente 4 lineas: CLIENTE_ENVIA, CLIENTE_RECIBE, TC, IMPORTE."
+        )
+
+    cliente_envia = extract_structured_value(
+        lines[0],
+        {"CLIENTE ENVIA", "CLIENTE 1", "CLIENTE1"},
+    )
+    cliente_recibe = extract_structured_value(
+        lines[1],
+        {"CLIENTE RECIBE", "CLIENTE 2", "CLIENTE2"},
+    )
+    tc_raw = extract_structured_value(lines[2], {"TC", "TIPO CAMBIO", "TIPO DE CAMBIO"})
+    importe_raw = extract_structured_value(lines[3], {"IMPORTE", "MONTO"})
+
+    tc = parse_positive_number(tc_raw, field_name="TC", digits=6)
+    importe = parse_positive_number(importe_raw, field_name="IMPORTE", digits=2)
+    return StructuredOperationInput(
+        cliente_envia=cliente_envia,
+        cliente_recibe=cliente_recibe,
+        tc=tc,
+        importe=importe,
+    )
+
+
+def looks_like_structured_operation_message(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) == 4:
+        return True
+    if not lines:
+        return False
+    head = normalize_label(lines[0])
+    return head.startswith("CLIENTE")
 
 
 def next_sequence(existing_ids: list[str]) -> int:
@@ -587,8 +672,11 @@ def clear_wizard_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Bot de operaciones financieras listo.\n\n"
+        "Carga una operacion enviando un mensaje de 4 lineas con este formato:\n"
+        f"{STRUCTURED_OPERATION_FORMAT}\n\n"
         "Comandos principales:\n"
-        "/menu - abre menu rapido\n"
+        "/menu - ayuda rapida sin botones\n"
+        "/formato - muestra plantilla de carga\n"
         "/setcliente C001 - vincula tu usuario a un cliente\n"
         "/saldo [C001] - saldo por cliente\n"
         "/cajas - saldo de cajas\n"
@@ -596,14 +684,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/comisiones [C001] [YYYY-MM-DD YYYY-MM-DD]\n"
         "/addcliente C001 \"Cliente Ejemplo\"\n"
         "/clientes\n"
-        "/void OP-YYYYMMDD-C001-0001\n\n"
-        "En cualquier wizard puedes usar /cancel."
+        "/void OP-YYYYMMDD-C001-0001"
     )
-    await reply(update, text, reply_markup=menu_keyboard())
+    await reply(update, text)
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, "Selecciona una opcion:", reply_markup=menu_keyboard())
+    text = (
+        "Menu rapido:\n"
+        "1) Para registrar operacion: envia 4 lineas (usa /formato)\n"
+        "2) Consultas: /saldo [C001] y /cajas\n"
+        "3) Clientes: /addcliente, /clientes, /setcliente\n"
+        "4) Comisiones: /setcomision y /comisiones\n"
+        "5) Anular: /void OP-YYYYMMDD-C001-0001\n"
+        "6) Flujos legacy por wizard (opcionales): /op, /cobro, /pago, /liquidar"
+    )
+    await reply(update, text)
+
+
+async def formato_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, STRUCTURED_OPERATION_FORMAT)
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -621,6 +721,132 @@ async def menu_shortcuts_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "menu:cajas":
         await send_cajas(update)
         return
+
+
+async def structured_operation_message_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not looks_like_structured_operation_message(text):
+        return
+
+    try:
+        payload = parse_structured_operation_message(text)
+    except (ValueError, ValidationError) as exc:
+        await reply(
+            update,
+            (
+                f"No pude interpretar el mensaje.\n{exc}\n\n"
+                f"{STRUCTURED_OPERATION_FORMAT}"
+            ),
+        )
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+    username = user.username if user and user.username else None
+    op_date = message.date.date() if message.date else date.today()
+
+    try:
+        with session_scope() as db:
+            cliente_envia = db.get(Client, payload.cliente_envia)
+            cliente_recibe = db.get(Client, payload.cliente_recibe)
+            if not cliente_envia:
+                await reply(update, f"CLIENTE_ENVIA {payload.cliente_envia} no existe.")
+                return
+            if not cliente_recibe:
+                await reply(update, f"CLIENTE_RECIBE {payload.cliente_recibe} no existe.")
+                return
+
+            display_id = compute_display_id(db, op_date, payload.cliente_envia)
+            tc_is_one = abs(payload.tc - 1.0) < 1e-9
+            pacto = PAGA_ARS if tc_is_one else PAGA_USD
+            contraparte_currency = ARS if tc_is_one else USD
+            contraparte_amount = (
+                payload.importe if tc_is_one else round(payload.importe / payload.tc, 2)
+            )
+            usd_pactados = None if tc_is_one else contraparte_amount
+
+            db.add(
+                Operation(
+                    display_id=display_id,
+                    op_date=op_date,
+                    cliente=payload.cliente_envia,
+                    contraparte=payload.cliente_recibe,
+                    monto_ars=payload.importe,
+                    pacto=pacto,
+                    usd_pactados=usd_pactados,
+                    tc=payload.tc,
+                    status=STATUS_OPEN,
+                    nota="Carga por mensaje estructurado",
+                    created_by_telegram_user_id=user_id,
+                    created_by_username=username,
+                    raw_message=text,
+                )
+            )
+
+            # Regla pedida: cliente 1 envia ARS => queda a pagar en ARS.
+            add_ledger_entry(
+                db=db,
+                client_code=payload.cliente_envia,
+                currency=ARS,
+                amount=-payload.importe,
+                ref_id=display_id,
+                entry_type=ENTRY_OP,
+                note="Alta automatica por mensaje estructurado",
+            )
+
+            # Regla pedida:
+            # - TC=1 => cliente 2 recibe ARS => queda a cobrar en ARS.
+            # - TC>1 => cliente 2 debe entregar USD => queda a cobrar en USD.
+            add_ledger_entry(
+                db=db,
+                client_code=payload.cliente_recibe,
+                currency=contraparte_currency,
+                amount=contraparte_amount,
+                ref_id=display_id,
+                entry_type=ENTRY_OP,
+                note="Alta automatica por mensaje estructurado",
+            )
+
+            commission_applied = apply_commission_if_any(
+                db=db,
+                client=cliente_envia,
+                ref_id=display_id,
+                note=f"Comision por {display_id}",
+            )
+
+            balance_envia = get_client_balances(db, payload.cliente_envia)
+            balance_recibe = get_client_balances(db, payload.cliente_recibe)
+
+        response_lines = [
+            f"Operacion registrada: {display_id}",
+            f"Fecha: {op_date.isoformat()}",
+            (
+                f"Detalle: {payload.cliente_envia} ARS -{payload.importe:.2f} | "
+                f"{payload.cliente_recibe} {contraparte_currency} +{contraparte_amount:.2f}"
+            ),
+            (
+                f"Saldo {payload.cliente_envia}: "
+                f"ARS {balance_envia[ARS]:.2f} | USD {balance_envia[USD]:.2f}"
+            ),
+            (
+                f"Saldo {payload.cliente_recibe}: "
+                f"ARS {balance_recibe[ARS]:.2f} | USD {balance_recibe[USD]:.2f}"
+            ),
+        ]
+        if commission_applied > 0:
+            response_lines.append(
+                f"Comision aplicada a {payload.cliente_envia}: ARS {commission_applied:.2f}"
+            )
+        await reply(update, "\n".join(response_lines))
+    except Exception as exc:
+        logger.exception("Error registrando operacion por mensaje", exc_info=exc)
+        await reply(update, "No pude registrar la operacion por un error interno.")
 
 
 async def setcliente_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1568,7 +1794,7 @@ async def liq_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, "Comando no reconocido. Usa /menu para ver opciones.")
+    await reply(update, "Comando no reconocido. Usa /menu o /formato para ver opciones.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1605,6 +1831,7 @@ def build_operation_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(op_cancel, pattern=r"^op:cancel$"),
         ],
+        per_message=True,
         allow_reentry=True,
     )
 
@@ -1634,6 +1861,7 @@ def build_cash_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(cash_cancel, pattern=r"^cash:cancel$"),
         ],
+        per_message=True,
         allow_reentry=True,
     )
 
@@ -1658,6 +1886,7 @@ def build_liq_conversation() -> ConversationHandler:
             CommandHandler("cancel", cancel_command),
             CallbackQueryHandler(liq_cancel, pattern=r"^liq:cancel$"),
         ],
+        per_message=True,
         allow_reentry=True,
     )
 
@@ -1669,6 +1898,7 @@ def register_handlers(application: Application) -> None:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("formato", formato_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("setcliente", setcliente_command))
     application.add_handler(CommandHandler("saldo", saldo_command))
@@ -1681,6 +1911,9 @@ def register_handlers(application: Application) -> None:
 
     application.add_handler(
         CallbackQueryHandler(menu_shortcuts_callback, pattern=r"^menu:(saldo|cajas)$")
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, structured_operation_message_handler)
     )
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     application.add_error_handler(error_handler)
