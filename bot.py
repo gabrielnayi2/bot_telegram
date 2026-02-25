@@ -8,6 +8,7 @@ import shlex
 import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -300,10 +301,12 @@ class StructuredOperationInput(BaseModel):
 
 ENGINE = None
 SessionLocal: Optional[sessionmaker] = None
+CURRENT_DATABASE_URL: Optional[str] = None
 
 
 def get_database_url() -> str:
-    raw_url = os.getenv("DATABASE_URL", "sqlite:///ops.db")
+    default_sqlite = f"sqlite:///{(Path(__file__).resolve().parent / 'ops.db').as_posix()}"
+    raw_url = os.getenv("DATABASE_URL", default_sqlite)
     if raw_url.startswith("postgres://"):
         return raw_url.replace("postgres://", "postgresql+psycopg://", 1)
     if raw_url.startswith("postgresql://") and "+psycopg" not in raw_url:
@@ -312,9 +315,10 @@ def get_database_url() -> str:
 
 
 def init_db() -> None:
-    global ENGINE, SessionLocal
+    global ENGINE, SessionLocal, CURRENT_DATABASE_URL
 
     database_url = get_database_url()
+    CURRENT_DATABASE_URL = database_url
     engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
     if database_url.startswith("sqlite"):
         engine_kwargs["connect_args"] = {"check_same_thread": False}
@@ -326,7 +330,7 @@ def init_db() -> None:
     with session_scope() as db:
         ensure_house_client(db)
 
-    logger.info("DB inicializada en %s", database_url)
+    logger.info("DB inicializada en %s (cwd=%s)", database_url, os.getcwd())
 
 
 @contextmanager
@@ -838,6 +842,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Comandos principales:\n"
         "/menu - ayuda rapida sin botones\n"
         "/formato - muestra plantilla de carga\n"
+        "/dbinfo - muestra DB activa y conteos\n"
         "/setcliente C001 - vincula tu usuario a un cliente\n"
         "/saldo [C001] - saldo por cliente\n"
         "/cajas - saldo de cajas\n"
@@ -857,7 +862,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = (
         "Menu rapido:\n"
         "1) Para registrar operacion: envia 4 lineas (usa /formato)\n"
-        "2) Consultas: /saldo [C001] y /cajas\n"
+        "2) Consultas: /saldo [C001], /cajas y /dbinfo\n"
         "3) Clientes: /nuevocliente, /importclientes, /delcliente, /clientes, /setcliente\n"
         "4) Comisiones: /setcomision y /comisiones\n"
         "5) Anular: /void OP-YYYYMMDD-C001-0001\n"
@@ -868,6 +873,31 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def formato_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, STRUCTURED_OPERATION_FORMAT)
+
+
+async def dbinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    database_url = CURRENT_DATABASE_URL or get_database_url()
+    lines = [f"DB URL: {database_url}"]
+
+    if database_url.startswith("sqlite:///"):
+        sqlite_path = Path(database_url.replace("sqlite:///", "", 1))
+        lines.append(f"Archivo: {sqlite_path}")
+        lines.append(f"Existe: {'si' if sqlite_path.exists() else 'no'}")
+
+    try:
+        with session_scope() as db:
+            clients_total = db.scalar(select(func.count(Client.code))) or 0
+            operations_total = db.scalar(select(func.count(Operation.id))) or 0
+            ledger_total = db.scalar(select(func.count(Ledger.id))) or 0
+            cash_total = db.scalar(select(func.count(CashMovement.id))) or 0
+        lines.append(f"Clientes: {int(clients_total)}")
+        lines.append(f"Operaciones: {int(operations_total)}")
+        lines.append(f"Asientos ledger: {int(ledger_total)}")
+        lines.append(f"Movimientos caja: {int(cash_total)}")
+    except Exception:
+        lines.append("No pude consultar conteos de DB en este momento.")
+
+    await reply(update, "\n".join(lines))
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2290,7 +2320,7 @@ async def liq_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(
         update,
-        "Comando no reconocido. Usa /menu, /formato o /nuevocliente para ver opciones.",
+        "Comando no reconocido. Usa /menu, /formato, /dbinfo o /nuevocliente para ver opciones.",
     )
 
 
@@ -2416,6 +2446,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("formato", formato_command))
+    application.add_handler(CommandHandler("dbinfo", dbinfo_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("setcliente", setcliente_command))
     application.add_handler(CommandHandler("saldo", saldo_command))

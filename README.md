@@ -75,7 +75,7 @@ Configura variables de entorno:
 export TELEGRAM_BOT_TOKEN="TU_TOKEN_AQUI"
 # Compatibilidad temporal (si creaste el secret con typo):
 # export ELEGRAM_BOT_TOKEN="TU_TOKEN_AQUI"
-# Opcional (si no se define, usa sqlite:///ops.db):
+# Opcional:
 # export DATABASE_URL="postgresql+psycopg://usuario:password@host:5432/bot_telegram"
 ```
 
@@ -124,6 +124,7 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 - `/start` - ayuda inicial
 - `/menu` - ayuda rapida (sin botones)
 - `/formato` - muestra plantilla de carga estructurada
+- `/dbinfo` - muestra DB activa y conteos
 - `/setcliente C001`
 - `/saldo [C001]`
 - `/cajas`
@@ -288,6 +289,7 @@ Con `/void OP-...`:
 Ejemplos:
 
 - SQLite por defecto: no definir `DATABASE_URL`
+  - usa archivo SQLite absoluto junto a `bot.py` (ej: `/workspaces/bot_telegram/ops.db`)
 - PostgreSQL:
   - `postgresql+psycopg://user:pass@localhost:5432/bot_telegram`
   - tambien acepta `postgres://...` y lo normaliza automaticamente
