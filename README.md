@@ -21,18 +21,21 @@ Modo principal: alta de operaciones por mensaje estructurado de 4 lineas (sin bo
      - `TC`
      - `IMPORTE`
    - Genera fecha e ID de operacion de forma automatica.
-   - Aplica reglas por TC y comision por cliente.
-2. **Registrar cobro** (mueve caja):
+   - Aplica reglas por TC y comision porcentual por cliente.
+2. **Alta de clientes con ID automatico**:
+   - Alta guiada (`/nuevocliente`) y alta masiva (`/importclientes`).
+   - IDs correlativos: `C001`, `C002`, ...
+3. **Registrar cobro** (mueve caja):
    - Reduce saldo a cobrar del cliente.
    - Incrementa caja efectiva.
-3. **Registrar pago** (mueve caja):
+4. **Registrar pago** (mueve caja):
    - Reduce saldo a pagar del cliente.
    - Disminuye caja efectiva.
-4. **Liquidar ARS→USD** global por cliente (no mueve caja):
+5. **Liquidar ARS→USD** global por cliente (no mueve caja):
    - Convierte ARS a favor en USD a favor con TC indicado.
-5. **Anular operacion** (`/void OP-...`):
+6. **Anular operacion** (`/void OP-...`):
    - Revierte asientos OP/COM con asientos `VOID`.
-6. **Consultas**:
+7. **Consultas**:
    - saldo por cliente
    - saldo de cajas
    - total de comisiones (HOUSE o por cliente)
@@ -83,12 +86,24 @@ python bot.py
 
 ## Carga inicial de clientes
 
-Puedes cargar clientes desde Telegram con:
+Opciones recomendadas:
+
+```text
+/nuevocliente
+# (el bot pide nombre y comision %, y genera ID automatico: C001, C002, ...)
+
+/importclientes
+Cliente Uno;1.5
+Cliente Dos;sin
+Cliente Tres;0
+
+/clientes
+```
+
+Tambien existe comando legacy manual:
 
 ```text
 /addcliente C001 "Cliente Uno"
-/addcliente C002 "Cliente Dos"
-/clientes
 ```
 
 Tambien puedes vincular tu usuario de Telegram a un cliente:
@@ -107,18 +122,21 @@ Esto permite que varios flujos tomen ese cliente por defecto.
 - `/setcliente C001`
 - `/saldo [C001]`
 - `/cajas`
-- `/setcomision C001 1500` (usa 0 para desactivar)
+- `/setcomision C001 1.5` (porcentaje; usa 0 para desactivar)
 - `/comisiones`
 - `/comisiones C001`
 - `/comisiones 2026-01-01 2026-01-31`
 - `/comisiones C001 2026-01-01 2026-01-31`
-- `/addcliente C001 "Nombre"`
+- `/nuevocliente` (alta guiada con ID automatico)
+- `/importclientes` (alta masiva por listado)
+- `/addcliente C001 "Nombre"` (legacy/manual)
 - `/clientes`
 - `/void OP-YYYYMMDD-C001-0001`
 - `/cancel` (durante flujos wizard legacy)
 
 ## IDs humanos
 
+- Clientes: `C001`, `C002`, ... (auto-generados por el bot)
 - Operaciones: `OP-YYYYMMDD-<CLIENTE>-0001`
 - Liquidaciones: `LQ-YYYYMMDD-<CLIENTE>-0001`
 
@@ -163,7 +181,9 @@ Reglas aplicadas por el bot:
 - Si `TC > 1`:
   - `CLIENTE_ENVIA` queda en ARS a pagar (`-IMPORTE`).
   - `CLIENTE_RECIBE` queda en USD a cobrar (`+(IMPORTE/TC)` redondeado a 2 decimales).
-- Si el cliente tiene comision activa (`/setcomision`), se aplica automaticamente.
+- Si `CLIENTE_ENVIA` tiene comision activa (`/setcomision`), se aplica automaticamente:
+  - comision ARS = `IMPORTE * (%/100)`
+  - el saldo a pagar de `CLIENTE_ENVIA` se reduce por esa comision.
 
 ## Flujos wizard (legacy / opcionales)
 
@@ -186,7 +206,8 @@ Asientos:
 - Si `PAGA_USD`: `Ledger(contraparte, USD, -usd_pactados, OP)`
 - Si `PAGA_ARS`: `Ledger(contraparte, ARS, -monto_ars, OP)`
 - Si comision activa:
-  - `Ledger(cliente, ARS, -comision, COM)`
+  - `comision = monto_ars * (%/100)`
+  - `Ledger(cliente, ARS, -comision, COM)`  (flujo legacy)
   - `Ledger(HOUSE, ARS, +comision, COM)`
 
 ### 2) Cobro

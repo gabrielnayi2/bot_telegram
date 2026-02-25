@@ -102,12 +102,16 @@ STRUCTURED_OPERATION_FORMAT = (
     LIQ_TC,
     LIQ_NOTA,
     LIQ_CONFIRM,
-) = range(19)
+    NEW_CLIENT_NAME,
+    NEW_CLIENT_COMMISSION,
+    NEW_CLIENT_CONFIRM,
+) = range(22)
 
 
 OP_DATA_KEY = "wizard_op"
 CASH_DATA_KEY = "wizard_cash"
 LIQ_DATA_KEY = "wizard_liq"
+NEW_CLIENT_DATA_KEY = "wizard_new_client"
 
 
 class Base(DeclarativeBase):
@@ -313,7 +317,7 @@ def init_db() -> None:
         engine_kwargs["connect_args"] = {"check_same_thread": False}
 
     ENGINE = create_engine(database_url, **engine_kwargs)
-    SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False, expire_on_commit=False)
+    SessionLocal = sessionmaker(bind=ENGINE, autoflush=True, autocommit=False, expire_on_commit=False)
     Base.metadata.create_all(ENGINE)
 
     with session_scope() as db:
@@ -376,6 +380,21 @@ def normalize_note(raw: str) -> Optional[str]:
     return cleaned
 
 
+def parse_commission_percentage(raw: str) -> float:
+    cleaned = raw.strip().lower().replace(",", ".").replace("%", "")
+    if cleaned in {"", "sin", "none", "no", "0", "0.0", "-"}:
+        return 0.0
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise ValueError("Porcentaje de comision invalido.") from exc
+    if value < 0:
+        raise ValueError("La comision no puede ser negativa.")
+    if value > 100:
+        raise ValueError("La comision no puede superar 100%.")
+    return round(value, 4)
+
+
 def normalize_label(raw: str) -> str:
     translated = raw.upper().translate(str.maketrans("ÁÉÍÓÚÜ", "AEIOUU"))
     return re.sub(r"[^A-Z0-9]+", " ", translated).strip()
@@ -427,6 +446,70 @@ def looks_like_structured_operation_message(text: str) -> bool:
         return False
     head = normalize_label(lines[0])
     return head.startswith("CLIENTE")
+
+
+def extract_numeric_client_sequence(code: str) -> Optional[int]:
+    match = re.match(r"^C(\d+)$", normalize_client_code(code))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def compute_next_client_code(db: Session) -> str:
+    codes = db.execute(select(Client.code)).scalars().all()
+    max_seq = 0
+    for code in codes:
+        seq = extract_numeric_client_sequence(code)
+        if seq is not None:
+            max_seq = max(max_seq, seq)
+    next_seq = max_seq + 1
+    width = max(3, len(str(next_seq)))
+    return f"C{next_seq:0{width}d}"
+
+
+def create_client_with_auto_code(
+    db: Session,
+    name: str,
+    commission_pct: float,
+) -> Client:
+    if not name.strip():
+        raise ValueError("El nombre del cliente no puede estar vacio.")
+
+    commission_enabled = commission_pct > 0
+    # Reintenta en caso de colision de codigo por concurrencia.
+    for _ in range(5):
+        code = compute_next_client_code(db)
+        if db.get(Client, code):
+            continue
+        client = Client(
+            code=code,
+            name=name.strip(),
+            commission_enabled=commission_enabled,
+            commission_ars=commission_pct,
+        )
+        db.add(client)
+        db.flush()
+        return client
+    raise RuntimeError("No pude generar un codigo de cliente unico. Reintenta.")
+
+
+def resolve_client_by_identifier(db: Session, identifier: str) -> tuple[Optional[Client], Optional[str]]:
+    normalized = normalize_client_code(identifier)
+    by_code = db.get(Client, normalized)
+    if by_code:
+        return by_code, None
+
+    by_name = db.execute(
+        select(Client).where(func.lower(Client.name) == identifier.strip().lower())
+    ).scalars().all()
+    if len(by_name) == 1:
+        return by_name[0], None
+    if len(by_name) > 1:
+        return None, (
+            f"El identificador '{identifier}' coincide con varios clientes por nombre. "
+            "Usa el codigo (ej: C001)."
+        )
+    return None, f"No existe cliente con codigo o nombre '{identifier}'."
 
 
 def next_sequence(existing_ids: list[str]) -> int:
@@ -556,20 +639,25 @@ def apply_commission_if_any(
     db: Session,
     client: Client,
     ref_id: str,
+    base_amount_ars: float,
+    client_entry_sign: int = -1,
     note: Optional[str] = None,
 ) -> float:
     if not client.commission_enabled:
         return 0.0
-    amount = round(float(client.commission_ars or 0.0), 2)
+    commission_pct = round(float(client.commission_ars or 0.0), 4)
+    if commission_pct <= 0:
+        return 0.0
+    amount = round(base_amount_ars * (commission_pct / 100.0), 2)
     if amount <= 0:
         return 0.0
     ensure_house_client(db)
-    note_text = note or "Comision fija por operacion."
+    note_text = note or f"Comision {commission_pct:.4g}% por operacion."
     add_ledger_entry(
         db=db,
         client_code=client.code,
         currency=ARS,
-        amount=-amount,
+        amount=client_entry_sign * amount,
         ref_id=ref_id,
         entry_type=ENTRY_COM,
         note=note_text,
@@ -667,6 +755,7 @@ def clear_wizard_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(OP_DATA_KEY, None)
     context.user_data.pop(CASH_DATA_KEY, None)
     context.user_data.pop(LIQ_DATA_KEY, None)
+    context.user_data.pop(NEW_CLIENT_DATA_KEY, None)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -680,8 +769,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/setcliente C001 - vincula tu usuario a un cliente\n"
         "/saldo [C001] - saldo por cliente\n"
         "/cajas - saldo de cajas\n"
-        "/setcomision C001 1500 - comision fija por operacion\n"
+        "/setcomision C001 1.5 - comision porcentual (% sobre importe)\n"
         "/comisiones [C001] [YYYY-MM-DD YYYY-MM-DD]\n"
+        "/nuevocliente - alta guiada con ID automatico\n"
+        "/importclientes - alta masiva por listado\n"
         "/addcliente C001 \"Cliente Ejemplo\"\n"
         "/clientes\n"
         "/void OP-YYYYMMDD-C001-0001"
@@ -694,7 +785,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Menu rapido:\n"
         "1) Para registrar operacion: envia 4 lineas (usa /formato)\n"
         "2) Consultas: /saldo [C001] y /cajas\n"
-        "3) Clientes: /addcliente, /clientes, /setcliente\n"
+        "3) Clientes: /nuevocliente, /importclientes, /clientes, /setcliente\n"
         "4) Comisiones: /setcomision y /comisiones\n"
         "5) Anular: /void OP-YYYYMMDD-C001-0001\n"
         "6) Flujos legacy por wizard (opcionales): /op, /cobro, /pago, /liquidar"
@@ -753,16 +844,19 @@ async def structured_operation_message_handler(
 
     try:
         with session_scope() as db:
-            cliente_envia = db.get(Client, payload.cliente_envia)
-            cliente_recibe = db.get(Client, payload.cliente_recibe)
-            if not cliente_envia:
-                await reply(update, f"CLIENTE_ENVIA {payload.cliente_envia} no existe.")
+            cliente_envia, error_envia = resolve_client_by_identifier(db, payload.cliente_envia)
+            if error_envia:
+                await reply(update, f"CLIENTE_ENVIA invalido. {error_envia}")
                 return
-            if not cliente_recibe:
-                await reply(update, f"CLIENTE_RECIBE {payload.cliente_recibe} no existe.")
+            cliente_recibe, error_recibe = resolve_client_by_identifier(db, payload.cliente_recibe)
+            if error_recibe:
+                await reply(update, f"CLIENTE_RECIBE invalido. {error_recibe}")
+                return
+            if cliente_envia.code == cliente_recibe.code:
+                await reply(update, "CLIENTE_ENVIA y CLIENTE_RECIBE no pueden ser el mismo cliente.")
                 return
 
-            display_id = compute_display_id(db, op_date, payload.cliente_envia)
+            display_id = compute_display_id(db, op_date, cliente_envia.code)
             tc_is_one = abs(payload.tc - 1.0) < 1e-9
             pacto = PAGA_ARS if tc_is_one else PAGA_USD
             contraparte_currency = ARS if tc_is_one else USD
@@ -775,8 +869,8 @@ async def structured_operation_message_handler(
                 Operation(
                     display_id=display_id,
                     op_date=op_date,
-                    cliente=payload.cliente_envia,
-                    contraparte=payload.cliente_recibe,
+                    cliente=cliente_envia.code,
+                    contraparte=cliente_recibe.code,
                     monto_ars=payload.importe,
                     pacto=pacto,
                     usd_pactados=usd_pactados,
@@ -792,7 +886,7 @@ async def structured_operation_message_handler(
             # Regla pedida: cliente 1 envia ARS => queda a pagar en ARS.
             add_ledger_entry(
                 db=db,
-                client_code=payload.cliente_envia,
+                client_code=cliente_envia.code,
                 currency=ARS,
                 amount=-payload.importe,
                 ref_id=display_id,
@@ -805,7 +899,7 @@ async def structured_operation_message_handler(
             # - TC>1 => cliente 2 debe entregar USD => queda a cobrar en USD.
             add_ledger_entry(
                 db=db,
-                client_code=payload.cliente_recibe,
+                client_code=cliente_recibe.code,
                 currency=contraparte_currency,
                 amount=contraparte_amount,
                 ref_id=display_id,
@@ -817,31 +911,33 @@ async def structured_operation_message_handler(
                 db=db,
                 client=cliente_envia,
                 ref_id=display_id,
+                base_amount_ars=payload.importe,
+                client_entry_sign=1,
                 note=f"Comision por {display_id}",
             )
 
-            balance_envia = get_client_balances(db, payload.cliente_envia)
-            balance_recibe = get_client_balances(db, payload.cliente_recibe)
+            balance_envia = get_client_balances(db, cliente_envia.code)
+            balance_recibe = get_client_balances(db, cliente_recibe.code)
 
         response_lines = [
             f"Operacion registrada: {display_id}",
             f"Fecha: {op_date.isoformat()}",
             (
-                f"Detalle: {payload.cliente_envia} ARS -{payload.importe:.2f} | "
-                f"{payload.cliente_recibe} {contraparte_currency} +{contraparte_amount:.2f}"
+                f"Detalle: {cliente_envia.code} ARS -{payload.importe:.2f} | "
+                f"{cliente_recibe.code} {contraparte_currency} +{contraparte_amount:.2f}"
             ),
             (
-                f"Saldo {payload.cliente_envia}: "
+                f"Saldo {cliente_envia.code}: "
                 f"ARS {balance_envia[ARS]:.2f} | USD {balance_envia[USD]:.2f}"
             ),
             (
-                f"Saldo {payload.cliente_recibe}: "
+                f"Saldo {cliente_recibe.code}: "
                 f"ARS {balance_recibe[ARS]:.2f} | USD {balance_recibe[USD]:.2f}"
             ),
         ]
         if commission_applied > 0:
             response_lines.append(
-                f"Comision aplicada a {payload.cliente_envia}: ARS {commission_applied:.2f}"
+                f"Comision aplicada a {cliente_envia.code}: ARS {commission_applied:.2f}"
             )
         await reply(update, "\n".join(response_lines))
     except Exception as exc:
@@ -927,6 +1023,166 @@ async def cajas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await send_cajas(update)
 
 
+def parse_import_client_line(raw_line: str) -> tuple[str, float]:
+    line = raw_line.strip()
+    if not line:
+        raise ValueError("Linea vacia.")
+    for sep in (";", "|"):
+        if sep in line:
+            name, commission_raw = line.split(sep, 1)
+            name = name.strip()
+            commission_pct = parse_commission_percentage(commission_raw)
+            if not name:
+                raise ValueError("Nombre vacio en una linea del listado.")
+            return name, commission_pct
+    return line, 0.0
+
+
+async def nuevocliente_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data[NEW_CLIENT_DATA_KEY] = {}
+    await reply(update, "Alta de cliente nueva.\nIngresa nombre del cliente:")
+    return NEW_CLIENT_NAME
+
+
+async def nuevocliente_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = (update.effective_message.text if update.effective_message else "").strip()
+    if not name:
+        await reply(update, "El nombre no puede estar vacio. Ingresa nombre del cliente:")
+        return NEW_CLIENT_NAME
+    if len(name) > 120:
+        await reply(update, "Nombre demasiado largo (maximo 120 caracteres). Intenta de nuevo:")
+        return NEW_CLIENT_NAME
+
+    context.user_data[NEW_CLIENT_DATA_KEY] = {"name": name}
+    await reply(
+        update,
+        "Ingresa comision % (ej: 1.5) o escribe 'sin' para no cobrar comision:",
+    )
+    return NEW_CLIENT_COMMISSION
+
+
+async def nuevocliente_commission_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    commission_raw = (update.effective_message.text if update.effective_message else "").strip()
+    try:
+        commission_pct = parse_commission_percentage(commission_raw)
+    except ValueError as exc:
+        await reply(update, f"{exc} Intenta nuevamente:")
+        return NEW_CLIENT_COMMISSION
+
+    data = context.user_data.get(NEW_CLIENT_DATA_KEY, {})
+    name = data.get("name")
+    if not name:
+        await reply(update, "No encuentro el nombre del cliente. Reinicia con /nuevocliente.")
+        return ConversationHandler.END
+
+    with session_scope() as db:
+        preview_code = compute_next_client_code(db)
+
+    data["commission_pct"] = commission_pct
+    context.user_data[NEW_CLIENT_DATA_KEY] = data
+
+    summary = (
+        "Resumen alta de cliente:\n"
+        f"- ID sugerido: {preview_code}\n"
+        f"- Nombre: {name}\n"
+        f"- Comision: {commission_pct:.4g}%\n\n"
+        "Responde CONFIRMAR para crear o CANCELAR para abortar."
+    )
+    await reply(update, summary)
+    return NEW_CLIENT_CONFIRM
+
+
+async def nuevocliente_confirm_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    answer = (update.effective_message.text if update.effective_message else "").strip().lower()
+    if answer in {"cancelar", "cancel", "no"}:
+        context.user_data.pop(NEW_CLIENT_DATA_KEY, None)
+        await reply(update, "Alta de cliente cancelada.")
+        return ConversationHandler.END
+    if answer not in {"confirmar", "confirm", "si", "sí"}:
+        await reply(update, "Respuesta invalida. Escribe CONFIRMAR o CANCELAR.")
+        return NEW_CLIENT_CONFIRM
+
+    data = context.user_data.get(NEW_CLIENT_DATA_KEY, {})
+    name = data.get("name")
+    commission_pct = float(data.get("commission_pct", 0.0))
+    if not name:
+        await reply(update, "No encuentro datos del cliente. Reinicia con /nuevocliente.")
+        return ConversationHandler.END
+
+    try:
+        with session_scope() as db:
+            client = create_client_with_auto_code(db, name=name, commission_pct=commission_pct)
+        await reply(
+            update,
+            (
+                f"Cliente creado: {client.code}\n"
+                f"Nombre: {client.name}\n"
+                f"Comision: {commission_pct:.4g}%"
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Error creando cliente nuevo", exc_info=exc)
+        await reply(update, "No pude crear el cliente por un error interno.")
+    finally:
+        context.user_data.pop(NEW_CLIENT_DATA_KEY, None)
+    return ConversationHandler.END
+
+
+async def nuevocliente_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop(NEW_CLIENT_DATA_KEY, None)
+    await reply(update, "Alta de cliente cancelada.")
+    return ConversationHandler.END
+
+
+async def importclientes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    lines = message.text.splitlines()
+    raw_lines = [line for line in lines[1:] if line.strip()]
+    if not raw_lines:
+        await reply(
+            update,
+            (
+                "Uso:\n"
+                "/importclientes\n"
+                "Nombre Cliente A;1.5\n"
+                "Nombre Cliente B;sin\n"
+                "Nombre Cliente C"
+            ),
+        )
+        return
+
+    parsed: list[tuple[str, float]] = []
+    try:
+        for line in raw_lines:
+            parsed.append(parse_import_client_line(line))
+    except ValueError as exc:
+        await reply(update, f"Error en listado: {exc}")
+        return
+
+    try:
+        with session_scope() as db:
+            created: list[Client] = []
+            for name, commission_pct in parsed:
+                created.append(
+                    create_client_with_auto_code(
+                        db,
+                        name=name,
+                        commission_pct=commission_pct,
+                    )
+                )
+        lines_out = [
+            f"- {client.code}: {client.name} | comision {client.commission_ars:.4g}%"
+            for client in created
+        ]
+        await reply(update, "Clientes creados:\n" + "\n".join(lines_out))
+    except Exception as exc:
+        logger.exception("Error importando clientes", exc_info=exc)
+        await reply(update, "No pude importar clientes por un error interno.")
+
+
 async def addcliente_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_message.text:
         return
@@ -936,7 +1192,7 @@ async def addcliente_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await reply(update, "No pude leer el comando. Usa comillas bien cerradas.")
         return
     if len(tokens) < 3:
-        await reply(update, 'Uso: /addcliente C001 "Nombre del cliente"')
+        await reply(update, 'Uso legacy: /addcliente C001 "Nombre del cliente"')
         return
 
     client_code = normalize_client_code(tokens[1])
@@ -976,7 +1232,7 @@ async def clientes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lines = []
     for client in clients:
         if client.commission_enabled and client.commission_ars > 0:
-            lines.append(f"- {client.code}: {client.name} | comision {client.commission_ars:.2f} ARS")
+            lines.append(f"- {client.code}: {client.name} | comision {client.commission_ars:.4g}%")
         else:
             lines.append(f"- {client.code}: {client.name}")
     await reply(update, "Clientes:\n" + "\n".join(lines))
@@ -984,34 +1240,29 @@ async def clientes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def setcomision_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 2:
-        await reply(update, "Uso: /setcomision C001 1500")
+        await reply(update, "Uso: /setcomision C001 1.5")
         return
 
     client_code = normalize_client_code(context.args[0])
     try:
-        amount = float(context.args[1].strip().replace(",", "."))
-    except ValueError:
-        await reply(update, "Monto de comision invalido.")
+        commission_pct = parse_commission_percentage(context.args[1])
+    except ValueError as exc:
+        await reply(update, str(exc))
         return
-
-    if amount < 0:
-        await reply(update, "La comision no puede ser negativa.")
-        return
-    amount = round(amount, 2)
 
     with session_scope() as db:
         client = db.get(Client, client_code)
         if not client:
             await reply(update, f"Cliente {client_code} no existe.")
             return
-        if amount <= 0:
+        if commission_pct <= 0:
             client.commission_enabled = False
             client.commission_ars = 0.0
             await reply(update, f"Comision desactivada para {client_code}.")
             return
         client.commission_enabled = True
-        client.commission_ars = amount
-    await reply(update, f"Comision para {client_code}: ARS {amount:.2f} por operacion.")
+        client.commission_ars = commission_pct
+    await reply(update, f"Comision para {client_code}: {commission_pct:.4g}% sobre importe enviado.")
 
 
 def parse_comisiones_args(args: list[str]) -> tuple[Optional[str], Optional[date], Optional[date]]:
@@ -1047,25 +1298,31 @@ async def comisiones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     with session_scope() as db:
         ensure_house_client(db)
-        base_query = select(func.coalesce(func.sum(Ledger.amount), 0.0)).where(
+        house_query = select(func.coalesce(func.sum(Ledger.amount), 0.0)).where(
+            Ledger.entry_type == ENTRY_COM,
+            Ledger.currency == ARS,
+            Ledger.client_code == HOUSE_CODE,
+        )
+        client_query = select(func.coalesce(func.sum(func.abs(Ledger.amount)), 0.0)).where(
             Ledger.entry_type == ENTRY_COM,
             Ledger.currency == ARS,
         )
         if start_date and end_date:
             start_dt = datetime.combine(start_date, time.min)
             end_dt = datetime.combine(end_date + timedelta(days=1), time.min)
-            base_query = base_query.where(Ledger.ts >= start_dt, Ledger.ts < end_dt)
+            house_query = house_query.where(Ledger.ts >= start_dt, Ledger.ts < end_dt)
+            client_query = client_query.where(Ledger.ts >= start_dt, Ledger.ts < end_dt)
 
         if client_code:
             client = db.get(Client, client_code)
             if not client:
                 await reply(update, f"Cliente {client_code} no existe.")
                 return
-            total_client = db.scalar(base_query.where(Ledger.client_code == client_code)) or 0.0
-            total = -float(total_client)  # al cliente se le descuenta en negativo
+            total_client = db.scalar(client_query.where(Ledger.client_code == client_code)) or 0.0
+            total = float(total_client)
             label = f"Comisiones cobradas a {client_code}"
         else:
-            total_house = db.scalar(base_query.where(Ledger.client_code == HOUSE_CODE)) or 0.0
+            total_house = db.scalar(house_query) or 0.0
             total = float(total_house)
             label = "Comisiones acumuladas en HOUSE"
 
@@ -1260,8 +1517,10 @@ async def op_nota_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     with session_scope() as db:
         client = db.get(Client, model.cliente)
         commission_preview = 0.0
+        commission_pct = 0.0
         if client and client.commission_enabled and client.commission_ars > 0:
-            commission_preview = round(client.commission_ars, 2)
+            commission_pct = round(client.commission_ars, 4)
+            commission_preview = round(model.monto_ars * (commission_pct / 100.0), 2)
 
     summary_lines = [
         "Resumen nueva operacion:",
@@ -1275,7 +1534,9 @@ async def op_nota_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if model.tc:
         summary_lines.append(f"- TC: {model.tc}")
     if commission_preview > 0:
-        summary_lines.append(f"- Comision aplicada: ARS {commission_preview:.2f}")
+        summary_lines.append(
+            f"- Comision estimada: ARS {commission_preview:.2f} ({commission_pct:.4g}%)"
+        )
     if model.nota:
         summary_lines.append(f"- Nota: {model.nota}")
 
@@ -1360,6 +1621,8 @@ async def op_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 db=db,
                 client=cliente,
                 ref_id=display_id,
+                base_amount_ars=payload.monto_ars,
+                client_entry_sign=-1,
                 note=f"Comision por {display_id}",
             )
 
@@ -1794,7 +2057,10 @@ async def liq_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, "Comando no reconocido. Usa /menu o /formato para ver opciones.")
+    await reply(
+        update,
+        "Comando no reconocido. Usa /menu, /formato o /nuevocliente para ver opciones.",
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1803,6 +2069,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text(
             "Ocurrio un error inesperado. Intenta nuevamente en unos segundos."
         )
+
+
+def build_new_client_conversation() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CommandHandler("nuevocliente", nuevocliente_start)],
+        states={
+            NEW_CLIENT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, nuevocliente_name_received)
+            ],
+            NEW_CLIENT_COMMISSION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, nuevocliente_commission_received)
+            ],
+            NEW_CLIENT_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, nuevocliente_confirm_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", nuevocliente_cancel)],
+        allow_reentry=True,
+    )
 
 
 def build_operation_conversation() -> ConversationHandler:
@@ -1892,6 +2177,7 @@ def build_liq_conversation() -> ConversationHandler:
 
 
 def register_handlers(application: Application) -> None:
+    application.add_handler(build_new_client_conversation())
     application.add_handler(build_operation_conversation())
     application.add_handler(build_cash_conversation())
     application.add_handler(build_liq_conversation())
@@ -1905,6 +2191,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("cajas", cajas_command))
     application.add_handler(CommandHandler("setcomision", setcomision_command))
     application.add_handler(CommandHandler("comisiones", comisiones_command))
+    application.add_handler(CommandHandler("importclientes", importclientes_command))
     application.add_handler(CommandHandler("addcliente", addcliente_command))
     application.add_handler(CommandHandler("clientes", clientes_command))
     application.add_handler(CommandHandler("void", void_command))
